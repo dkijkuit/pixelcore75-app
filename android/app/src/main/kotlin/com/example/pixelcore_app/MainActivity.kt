@@ -1,4 +1,4 @@
-package com.example.crypto_ticker_ble
+package com.example.pixelcore_app
 
 import io.flutter.embedding.android.FlutterActivity
 

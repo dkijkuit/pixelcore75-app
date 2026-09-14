@@ -1,12 +1,12 @@
-// =============================
-// lib/main.dart
-// =============================
-
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show FilteringTextInputFormatter;
+import 'package:pixelcore_app/ble/ble_service.dart';
+import 'package:pixelcore_app/ble/fields.dart';
+import 'package:pixelcore_app/ble/uuids.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -15,34 +15,13 @@ void main() {
   runApp(const BleConfigApp());
 }
 
-// ======= CONFIG =======
-// Your custom service UUID (iOS/Android only)
-const String kTargetServiceUuid = "975a3183-e5f1-448a-acab-2016d89c1fe7";
-
-// Friendly characteristic UUIDs
-const String kUuidHostname = "38487a5b-f731-4118-bf66-4ee253d5f664";
-const String kUuidServerPort = "e67e6360-99f3-4c6b-8e60-2e9266100718";
-const String kUuidWifiSsid = "7a034f21-a679-4d51-a284-e6b4b69ceea9";
-const String kUuidWifiPassword = "3f007796-2fd1-42d2-b122-458f1f0b90bf";
-const String kUuidBrightness = "a7423ece-dced-4fb2-ac67-ddf97323726b";
-const String kUuidRestart = "81ed8290-f167-47b9-b183-2f248c543889";
-
-const Map<String, String> kCharNames = {
-  kUuidHostname: "Server hostname",
-  kUuidServerPort: "Server port",
-  kUuidWifiSsid: "Wifi SSID",
-  kUuidWifiPassword: "Wifi password",
-  kUuidBrightness: "Brightness",
-  kUuidRestart: "Restart device",
-};
-
 class BleConfigApp extends StatelessWidget {
   const BleConfigApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'BLE Config',
+      title: 'PixelCore75',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
         useMaterial3: true,
@@ -62,46 +41,44 @@ class ScanPage extends StatefulWidget {
 }
 
 class _ScanPageState extends State<ScanPage> {
-  late final FlutterReactiveBle _ble;
-  late final Uuid _serviceUuid;
+  final BleService _bleService = BleService.instance;
   StreamSubscription<DiscoveredDevice>? _scanSub;
+  Timer? _scanTimeout;
   final Map<String, DiscoveredDevice> _found = {};
   bool _scanning = false;
   String? _error;
-
-  bool get _isSupportedPlatform =>
-      !kIsWeb &&
-      (defaultTargetPlatform == TargetPlatform.iOS ||
-          defaultTargetPlatform == TargetPlatform.android);
+  bool _needsSettings = false;
 
   @override
   void initState() {
     super.initState();
-    _serviceUuid = Uuid.parse(kTargetServiceUuid);
-    if (!_isSupportedPlatform) {
+    if (!_bleService.isSupportedPlatform) {
       _error = 'BLE is only supported on iOS/Android physical devices.';
       return;
     }
-    _ble = FlutterReactiveBle();
     _ensurePermissionsAndStart();
   }
 
   Future<void> _ensurePermissionsAndStart() async {
+    BlePermissionResult result;
     try {
-      if (defaultTargetPlatform == TargetPlatform.android) {
-        await [
-          Permission.bluetoothScan,
-          Permission.bluetoothConnect,
-          Permission.bluetooth,
-          Permission.locationWhenInUse,
-        ].request();
-      } else {
-        await [Permission.bluetooth, Permission.locationWhenInUse].request();
-      }
-      await _startScan();
+      result = await _bleService.requestPermissions();
     } catch (e) {
-      setState(() => _error = e.toString());
+      if (mounted) {
+        setState(() => _error = _bleService.friendlyError(e));
+      }
+      return;
     }
+    if (!mounted) return;
+    if (!result.granted) {
+      setState(() {
+        _scanning = false;
+        _needsSettings = result.needsSettings;
+        _error = result.message;
+      });
+      return;
+    }
+    await _startScan();
   }
 
   Future<void> _startScan() async {
@@ -109,30 +86,34 @@ class _ScanPageState extends State<ScanPage> {
       _found.clear();
       _scanning = true;
       _error = null;
+      _needsSettings = false;
     });
 
-    _scanSub?.cancel();
-    if (!_isSupportedPlatform) return;
+    unawaited(_scanSub?.cancel());
+    _scanTimeout?.cancel();
+    if (!_bleService.isSupportedPlatform) return;
 
-    _scanSub = _ble
+    _scanSub = _bleService.ble
         .scanForDevices(
-          withServices: [_serviceUuid],
+          withServices: [Uuid.parse(kTargetServiceUuid)],
           scanMode: ScanMode.lowLatency,
         )
         .listen(
           (device) => setState(() => _found[device.id] = device),
-          onError: (e) {
+          onError: (Object e) {
             setState(() {
-              _error = e.toString();
+              _error = _bleService.friendlyError(e);
               _scanning = false;
             });
           },
-          onDone: () => setState(() => _scanning = false),
+          onDone: () {
+            if (mounted) setState(() => _scanning = false);
+          },
         );
 
-    Future.delayed(const Duration(seconds: 15), () {
+    _scanTimeout = Timer(const Duration(seconds: 15), () {
       if (mounted && _scanning) {
-        _scanSub?.cancel();
+        unawaited(_scanSub?.cancel());
         setState(() => _scanning = false);
       }
     });
@@ -140,7 +121,8 @@ class _ScanPageState extends State<ScanPage> {
 
   @override
   void dispose() {
-    _scanSub?.cancel();
+    _scanTimeout?.cancel();
+    unawaited(_scanSub?.cancel());
     super.dispose();
   }
 
@@ -151,7 +133,7 @@ class _ScanPageState extends State<ScanPage> {
     );
 
     return Scaffold(
-      appBar: AppBar(title: const Text('BLE Devices')),
+      appBar: AppBar(title: const Text('PixelCore75 Setup')),
       body: RefreshIndicator(
         onRefresh: _startScan,
         child: ListView(
@@ -159,9 +141,20 @@ class _ScanPageState extends State<ScanPage> {
             if (_error != null)
               Padding(
                 padding: const EdgeInsets.all(12),
-                child: Text(
-                  'Error: $_error',
-                  style: const TextStyle(color: Colors.red),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _error!,
+                      style: const TextStyle(color: Colors.red),
+                    ),
+                    if (_needsSettings)
+                      TextButton.icon(
+                        onPressed: openAppSettings,
+                        icon: const Icon(Icons.settings),
+                        label: const Text('Open Settings'),
+                      ),
+                  ],
                 ),
               ),
             if (_scanning) const LinearProgressIndicator(minHeight: 2),
@@ -170,15 +163,17 @@ class _ScanPageState extends State<ScanPage> {
                 leading: const Icon(Icons.bluetooth),
                 title: Text(
                   d.name.isEmpty
-                      ? 'Unnamed (${d.id.substring(0, 6)}…) '
+                      ? 'Unnamed (${d.id.substring(0, d.id.length < 6 ? d.id.length : 6)}…)'
                       : d.name,
                 ),
                 subtitle: Text('RSSI ${d.rssi}  •  ${d.id}'),
                 onTap: () => Navigator.push(
                   context,
                   MaterialPageRoute(
-                    builder: (_) =>
-                        DeviceDetailsPage(device: d, serviceUuid: _serviceUuid),
+                    builder: (_) => DeviceDetailsPage(
+                      device: d,
+                      serviceUuid: Uuid.parse(kTargetServiceUuid),
+                    ),
                   ),
                 ),
               ),
@@ -217,28 +212,38 @@ class DeviceDetailsPage extends StatefulWidget {
 }
 
 class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
-  late final FlutterReactiveBle _ble;
+  final BleService _bleService = BleService.instance;
   StreamSubscription<ConnectionStateUpdate>? _connSub;
-  DiscoveredService? _targetService;
+  Service? _targetService;
   String? _status;
   String? _error;
+
+  /// Max bytes per write, derived from the negotiated MTU (ATT MTU minus
+  /// 3 bytes of header). Falls back to the conservative 20-byte default.
+  int _maxWriteLen = 20;
 
   final Map<QualifiedCharacteristic, TextEditingController> _controllers = {};
   final Map<QualifiedCharacteristic, List<int>> _originalValues = {};
 
+  /// Per-field user-visible problems (read failures, validation errors,
+  /// failed writes), shown as the field's errorText.
+  final Map<QualifiedCharacteristic, String> _fieldErrors = {};
+
+  /// Fields whose current value could not be read (e.g. write-only
+  /// characteristics). An untouched unread field is never written back.
+  final Set<QualifiedCharacteristic> _unreadable = {};
+
   // For the bottom Restart button
   QualifiedCharacteristic? _restartChar;
+  Timer? _statusReset;
 
   @override
   void initState() {
     super.initState();
-    if (kIsWeb ||
-        !(defaultTargetPlatform == TargetPlatform.iOS ||
-            defaultTargetPlatform == TargetPlatform.android)) {
+    if (!_bleService.isSupportedPlatform) {
       _error = 'BLE not supported on this platform (use iOS/Android device).';
       return;
     }
-    _ble = FlutterReactiveBle();
     _connectAndLoad();
   }
 
@@ -248,8 +253,8 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
       _error = null;
     });
 
-    _connSub?.cancel();
-    _connSub = _ble
+    unawaited(_connSub?.cancel());
+    _connSub = _bleService.ble
         .connectToDevice(
           id: widget.device.id,
           connectionTimeout: const Duration(seconds: 10),
@@ -257,39 +262,74 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
         .listen((update) async {
           switch (update.connectionState) {
             case DeviceConnectionState.connected:
+              if (!mounted) return;
               setState(() => _status = 'Discovering services…');
-              final services = await _ble.discoverServices(widget.device.id);
+              final List<Service> services;
+              try {
+                await _bleService.ble.discoverAllServices(widget.device.id);
+                services = await _bleService.ble
+                    .getDiscoveredServices(widget.device.id);
+              } catch (e) {
+                if (mounted) {
+                  setState(() {
+                    _status = '';
+                    _error = _bleService.friendlyError(e);
+                  });
+                }
+                return;
+              }
+              if (!mounted) return;
 
               _targetService = services.firstWhereOrNull(
-                (s) => s.serviceId == widget.serviceUuid,
+                (s) => s.id == widget.serviceUuid,
               );
 
               if (_targetService == null) {
-                setState(() => _error = 'Target service not found on device.');
+                setState(() {
+                  _status = '';
+                  _error = 'Target service not found on device.';
+                });
                 return;
               }
 
-              // Debug (optional): print characteristics of the matched service
-              // for (final ch in _targetService!.characteristics) {
-              //   debugPrint('Char: ${ch.characteristicId} '
-              //       'read=${ch.isReadable} '
-              //       'write=${ch.isWritableWithResponse || ch.isWritableWithoutResponse}');
-              // }
-
+              await _negotiateMtu();
               await _buildFields();
+              if (!mounted) return;
               setState(() => _status = '');
               break;
 
             case DeviceConnectionState.disconnecting:
             case DeviceConnectionState.disconnected:
-              if (mounted) setState(() => _status = 'Disconnected');
+              if (!mounted) return;
+              setState(() {
+                _status = 'Disconnected';
+                if (update.failure != null) {
+                  _error = _bleService.friendlyError(update.failure!);
+                }
+              });
               break;
 
             case DeviceConnectionState.connecting:
+              if (!mounted) return;
               setState(() => _status = 'Connecting…');
               break;
           }
-        }, onError: (e) => setState(() => _error = e.toString()));
+        }, onError: (Object e) {
+          if (mounted) setState(() => _error = _bleService.friendlyError(e));
+        });
+  }
+
+  /// Ask Android for a large MTU so multi-byte values (long passwords,
+  /// hostnames) fit in a single write. iOS negotiates its own (larger) MTU.
+  Future<void> _negotiateMtu() async {
+    if (!_bleService.isAndroid) return;
+    try {
+      final mtu = await _bleService.ble
+          .requestMtu(deviceId: widget.device.id, mtu: 517);
+      _maxWriteLen = mtu > 3 ? mtu - 3 : 20;
+    } catch (_) {
+      _maxWriteLen = 20;
+    }
   }
 
   Future<void> _buildFields() async {
@@ -298,57 +338,53 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
     }
     _controllers.clear();
     _originalValues.clear();
+    _fieldErrors.clear();
+    _unreadable.clear();
     _restartChar = null;
 
-    if (_targetService == null) return;
+    final service = _targetService;
+    if (service == null) return;
 
-    for (final ch in _targetService!.characteristics) {
+    for (final ch in service.characteristics) {
+      if (!mounted) return;
+
       final q = QualifiedCharacteristic(
         deviceId: widget.device.id,
         serviceId: widget.serviceUuid,
-        characteristicId: ch.characteristicId,
+        characteristicId: ch.id,
       );
-
-      final uuid = ch.characteristicId.toString().toLowerCase();
+      final uuid = normalizeUuid(ch.id.toString());
 
       // Capture restart characteristic for the bottom button
       if (uuid == kUuidRestart) {
         _restartChar = q;
+        continue;
       }
-
-      // For non-restart fields, prep controllers (read if readable)
-      if (uuid == kUuidRestart) continue;
 
       List<int> value = [];
       if (ch.isReadable) {
         try {
-          value = await _ble.readCharacteristic(q);
-        } catch (_) {}
+          value = await _bleService.ble.readCharacteristic(q);
+        } catch (_) {
+          if (!mounted) return;
+          _unreadable.add(q);
+          _fieldErrors[q] = 'Could not read current value.';
+        }
+      } else {
+        _unreadable.add(q);
       }
 
-      String displayValue = "";
-      if (uuid == kUuidBrightness && value.isNotEmpty) {
-        // Brightness: ASCII decimal preferred; fallback to first byte
+      String displayValue = '';
+      if (value.isNotEmpty) {
         try {
           final asText = utf8.decode(value, allowMalformed: true).trim();
-          final parsed = int.tryParse(asText);
-          displayValue = parsed != null
-              ? parsed.toString()
-              : value.first.toString();
-        } catch (_) {
-          displayValue = value.first.toString();
-        }
-      } else if (uuid == kUuidServerPort && value.isNotEmpty) {
-        try {
-          final asText = utf8.decode(value, allowMalformed: true).trim();
-          final parsed = int.tryParse(asText);
-          displayValue = (parsed != null) ? parsed.toString() : '';
-        } catch (_) {
-          displayValue = '';
-        }
-      } else if (value.isNotEmpty) {
-        try {
-          displayValue = utf8.decode(value, allowMalformed: true);
+          if (uuid == kUuidBrightness || uuid == kUuidServerPort) {
+            // Brightness/port are stored as ASCII decimal on the firmware.
+            final parsed = int.tryParse(asText);
+            displayValue = parsed != null ? parsed.toString() : '';
+          } else {
+            displayValue = asText;
+          }
         } catch (_) {
           displayValue = '';
         }
@@ -362,67 +398,143 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
 
   @override
   void dispose() {
+    _statusReset?.cancel();
     for (final c in _controllers.values) {
       c.dispose();
     }
-    _connSub?.cancel();
+    unawaited(_connSub?.cancel());
     super.dispose();
   }
 
-  Future<void> _writeAll() async {
-    if (_targetService == null) return;
+  /// Builds the bytes to write for a characteristic, or returns null when
+  /// the field should be skipped (restart, unchanged values).
+  List<int>? _encodeValue(String uuid, String text) {
+    if (uuid == kUuidBrightness || uuid == kUuidServerPort) {
+      return utf8.encode(text.trim());
+    }
+    return utf8.encode(text);
+  }
 
+  Future<void> _writeAll() async {
+    final service = _targetService;
+    if (service == null) return;
+
+    _statusReset?.cancel();
     setState(() {
-      _status = 'Writing…';
+      _status = 'Saving…';
       _error = null;
+      _fieldErrors.removeWhere((q, _) => !_unreadable.contains(q));
     });
 
+    // Validate everything first and abort before touching the device, so a
+    // rejected field can never leave the panel half-provisioned.
+    final problems = <QualifiedCharacteristic, String>{};
+    for (final ch in service.characteristics) {
+      final q = QualifiedCharacteristic(
+        deviceId: widget.device.id,
+        serviceId: widget.serviceUuid,
+        characteristicId: ch.id,
+      );
+      final uuid = normalizeUuid(ch.id.toString());
+      if (uuid == kUuidRestart) continue;
+      final controller = _controllers[q];
+      if (controller == null) continue;
+
+      final text = controller.text;
+      if (text.isEmpty && _unreadable.contains(q)) {
+        // Could not read and user typed nothing: leave the stored value.
+        continue;
+      }
+      final problem = validateField(uuid, text);
+      if (problem != null) problems[q] = problem;
+    }
+
+    if (problems.isNotEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _fieldErrors.addAll(problems);
+        _status = '';
+        _error = 'Fix the highlighted fields, then save again.';
+      });
+      return;
+    }
+
+    var attempted = 0;
+    var written = 0;
+    var failed = 0;
+
     try {
-      for (final ch in _targetService!.characteristics) {
+      for (final ch in service.characteristics) {
         final q = QualifiedCharacteristic(
           deviceId: widget.device.id,
           serviceId: widget.serviceUuid,
-          characteristicId: ch.characteristicId,
+          characteristicId: ch.id,
         );
-        final uuid = ch.characteristicId.toString().toLowerCase();
+        final uuid = normalizeUuid(ch.id.toString());
 
-        if (uuid == kUuidRestart) {
-          // Restart handled by its own button
+        if (uuid == kUuidRestart) continue; // handled by its own button
+
+        final controller = _controllers[q];
+        if (controller == null) continue;
+
+        // An untouched field we could not read must never be written back.
+        if (controller.text.isEmpty && _unreadable.contains(q)) {
           continue;
         }
 
-        final controller = _controllers[q]!;
-        List<int> newBytes;
-
-        if (uuid == kUuidBrightness) {
-          final min = 10;
-          final max = 255;
-          int v = int.tryParse(controller.text.trim()) ?? min;
-          v = v.clamp(min, max);
-          newBytes = utf8.encode(v.toString()); // ASCII
-        } else if (uuid == kUuidServerPort) {
-          int p = int.tryParse(controller.text.trim()) ?? 0;
-          if (p < 1) p = 1;
-          if (p > 65535) p = 65535;
-          newBytes = utf8.encode(p.toString()); // ASCII
-        } else {
-          newBytes = utf8.encode(controller.text); // ASCII UTF-8
-        }
-
+        final newBytes = _encodeValue(uuid, controller.text)!;
         final orig = _originalValues[q] ?? const <int>[];
         final changed = !const ListEquality<int>().equals(newBytes, orig);
+        if (!changed) continue;
+        if (!(ch.isWritableWithResponse || ch.isWritableWithoutResponse)) {
+          continue;
+        }
 
-        if (changed &&
-            (ch.isWritableWithResponse || ch.isWritableWithoutResponse)) {
-          await _ble.writeCharacteristicWithResponse(q, value: newBytes);
+        attempted++;
+        if (newBytes.length > _maxWriteLen) {
+          failed++;
+          setState(() {
+            _fieldErrors[q] =
+                'Value is ${newBytes.length} bytes but the device accepts '
+                '$_maxWriteLen per write. Shorten it.';
+          });
+          continue;
+        }
+
+        try {
+          await _bleService.ble.writeCharacteristicWithResponse(
+            q,
+            value: newBytes,
+          );
           _originalValues[q] = newBytes;
+          written++;
+          if (mounted) {
+            setState(() => _fieldErrors.remove(q));
+          }
+        } catch (e) {
+          failed++;
+          if (mounted) {
+            setState(() {
+              _fieldErrors[q] = 'Write failed: ${_bleService.friendlyError(e)}';
+            });
+          }
         }
       }
-      if (mounted) setState(() => _status = 'Write complete');
-    } catch (e) {
-      setState(() => _error = 'Write failed: $e');
+
+      if (!mounted) return;
+      setState(() {
+        if (failed > 0) {
+          _error =
+              'Saved $written of $attempted changed values. '
+              'See the highlighted fields.';
+        } else if (attempted == 0) {
+          _status = 'Nothing to save';
+        } else {
+          _status = 'Write complete';
+        }
+      });
     } finally {
-      Future.delayed(const Duration(seconds: 2), () {
+      _statusReset = Timer(const Duration(seconds: 2), () {
         if (mounted) setState(() => _status = '');
       });
     }
@@ -430,12 +542,16 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
 
   Future<void> _restartDevice(QualifiedCharacteristic q) async {
     try {
-      // Send ASCII "1" or single byte [1]; keep it consistent with firmware
-      await _ble.writeCharacteristicWithResponse(q, value: [1]);
+      // Firmware writes a single 0x01 to trigger a restart.
+      await _bleService.ble.writeCharacteristicWithResponse(q, value: [1]);
       if (mounted) setState(() => _status = 'Restart command sent');
     } catch (e) {
-      setState(() => _error = 'Restart failed: $e');
+      if (mounted) setState(() => _error = _bleService.friendlyError(e));
     }
+    _statusReset?.cancel();
+    _statusReset = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _status = '');
+    });
   }
 
   @override
@@ -466,75 +582,74 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
               ),
             )
           : Column(
-              children: [
-                if (_status?.isNotEmpty == true)
-                  LinearProgressIndicator(
-                    minHeight: 2,
-                    semanticsLabel: _status,
-                  ),
-                Expanded(
-                  child: ListView(
-                    padding: const EdgeInsets.all(12),
-                    children: [
-                      ..._buildCharacteristicWidgets(service),
-                      const SizedBox(height: 80),
-                    ],
-                  ),
-                ),
-                SafeArea(
-                  child: Padding(
-                    padding: const EdgeInsets.all(12.0),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_status?.isNotEmpty == true)
+                    LinearProgressIndicator(
+                      minHeight: 2,
+                      semanticsLabel: _status,
+                    ),
+                  Expanded(
+                    child: ListView(
+                      padding: const EdgeInsets.all(12),
                       children: [
-                        // Restart button (full-width, same style as Write All)
-                        SizedBox(
-                          width: double.infinity,
-                          child: FilledButton.icon(
-                            onPressed: () async {
-                              if (_restartChar == null) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(
-                                    content: Text(
-                                      'Restart characteristic not found in this service.',
-                                    ),
-                                  ),
-                                );
-                                return;
-                              }
-                              await _restartDevice(_restartChar!);
-                            },
-                            icon: const Icon(Icons.restart_alt),
-                            label: const Text('Restart Device'),
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        // Write All button
-                        SizedBox(
-                          width: double.infinity,
-                          child: FilledButton.icon(
-                            onPressed: _writeAll,
-                            icon: const Icon(Icons.save),
-                            label: const Text('Write All Modified Values'),
-                          ),
-                        ),
+                        ..._buildCharacteristicWidgets(service),
+                        const SizedBox(height: 80),
                       ],
                     ),
                   ),
-                ),
-              ],
-            ),
+                  SafeArea(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12.0),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // Restart button (full-width, same style as Write All)
+                          SizedBox(
+                            width: double.infinity,
+                            child: FilledButton.icon(
+                              onPressed: () async {
+                                if (_restartChar == null) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text(
+                                        'Restart characteristic not found in this service.',
+                                      ),
+                                    ),
+                                  );
+                                  return;
+                                }
+                                await _restartDevice(_restartChar!);
+                              },
+                              icon: const Icon(Icons.restart_alt),
+                              label: const Text('Restart Device'),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          // Write All button
+                          SizedBox(
+                            width: double.infinity,
+                            child: FilledButton.icon(
+                              onPressed: _writeAll,
+                              icon: const Icon(Icons.save),
+                              label: const Text('Write All Modified Values'),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
     );
   }
 
   // Build UI for all characteristics (hostname+port side-by-side)
-  List<Widget> _buildCharacteristicWidgets(DiscoveredService service) {
+  List<Widget> _buildCharacteristicWidgets(Service service) {
     final widgets = <Widget>[];
 
     // Index by UUID
     final byUuid = {
-      for (final ch in service.characteristics)
-        ch.characteristicId.toString().toLowerCase(): ch,
+      for (final ch in service.characteristics) normalizeUuid(ch.id.toString()): ch,
     };
 
     // Hostname + Port together
@@ -544,13 +659,13 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
 
     if (host != null && port != null) {
       widgets.add(_buildHostPortCard(host, port));
-      rendered.add(host.characteristicId.toString().toLowerCase());
-      rendered.add(port.characteristicId.toString().toLowerCase());
+      rendered.add(normalizeUuid(host.id.toString()));
+      rendered.add(normalizeUuid(port.id.toString()));
     }
 
     // Remaining characteristics
     for (final ch in service.characteristics) {
-      final id = ch.characteristicId.toString().toLowerCase();
+      final id = normalizeUuid(ch.id.toString());
       if (rendered.contains(id)) continue;
       // Do not render Restart here (handled by bottom button)
       if (id == kUuidRestart) continue;
@@ -560,19 +675,28 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
     return widgets;
   }
 
+  InputDecoration _fieldDecoration(String label, QualifiedCharacteristic q) {
+    return InputDecoration(
+      labelText: label,
+      border: const OutlineInputBorder(),
+      errorText: _fieldErrors[q],
+      counterText: '',
+    );
+  }
+
   Widget _buildHostPortCard(
-    DiscoveredCharacteristic host,
-    DiscoveredCharacteristic port,
+    Characteristic host,
+    Characteristic port,
   ) {
     final qHost = QualifiedCharacteristic(
       deviceId: widget.device.id,
       serviceId: widget.serviceUuid,
-      characteristicId: host.characteristicId,
+      characteristicId: host.id,
     );
     final qPort = QualifiedCharacteristic(
       deviceId: widget.device.id,
       serviceId: widget.serviceUuid,
-      characteristicId: port.characteristicId,
+      characteristicId: port.id,
     );
 
     final ctrlHost = _controllers[qHost]!;
@@ -592,15 +716,14 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
             const Text('Server', style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Expanded(
                   child: TextField(
                     controller: ctrlHost,
                     enabled: canWriteHost,
-                    decoration: const InputDecoration(
-                      labelText: 'Hostname',
-                      border: OutlineInputBorder(),
-                    ),
+                    maxLength: maxLengthFor(kUuidHostname),
+                    decoration: _fieldDecoration('Hostname', qHost),
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -610,10 +733,11 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
                     controller: ctrlPort,
                     enabled: canWritePort,
                     keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(
-                      labelText: 'Port',
-                      border: OutlineInputBorder(),
-                    ),
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                    ],
+                    maxLength: maxLengthFor(kUuidServerPort),
+                    decoration: _fieldDecoration('Port', qPort),
                   ),
                 ),
               ],
@@ -624,13 +748,13 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
     );
   }
 
-  Widget _buildCharacteristicCard(DiscoveredCharacteristic ch) {
+  Widget _buildCharacteristicCard(Characteristic ch) {
     final q = QualifiedCharacteristic(
       deviceId: widget.device.id,
       serviceId: widget.serviceUuid,
-      characteristicId: ch.characteristicId,
+      characteristicId: ch.id,
     );
-    final uuid = ch.characteristicId.toString().toLowerCase();
+    final uuid = normalizeUuid(ch.id.toString());
     final name = kCharNames[uuid] ?? uuid;
     final ctrl = _controllers[q]!;
     final isWritable =
@@ -638,8 +762,8 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
 
     // Brightness: slider + number (10–255), ASCII when writing
     if (uuid == kUuidBrightness) {
-      final min = 10;
-      final max = 255;
+      final min = kBrightnessMin;
+      final max = kBrightnessMax;
       int current = int.tryParse(ctrl.text) ?? min;
       current = current.clamp(min, max);
       return Card(
@@ -662,7 +786,7 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
                       onChanged: isWritable
                           ? (v) {
                               ctrl.text = v.round().toString();
-                              setState(() {});
+                              setState(() => _fieldErrors.remove(q));
                             }
                           : null,
                     ),
@@ -673,10 +797,11 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
                       controller: ctrl,
                       enabled: isWritable,
                       keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                        labelText: 'Value',
-                        border: OutlineInputBorder(),
-                      ),
+                      inputFormatters: [
+                        FilteringTextInputFormatter.digitsOnly,
+                      ],
+                      maxLength: maxLengthFor(kUuidBrightness),
+                      decoration: _fieldDecoration('Value', q),
                       onChanged: (_) => setState(() {}),
                     ),
                   ),
@@ -702,10 +827,12 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
               controller: ctrl,
               enabled: isWritable,
               obscureText: isPassword,
-              decoration: InputDecoration(
-                labelText: isPassword ? 'Enter password' : 'Value',
-                border: const OutlineInputBorder(),
+              maxLength: maxLengthFor(uuid),
+              decoration: _fieldDecoration(
+                isPassword ? 'Enter password (empty = keep current)' : 'Value',
+                q,
               ),
+              onChanged: (_) => setState(() => _fieldErrors.remove(q)),
             ),
           ],
         ),
